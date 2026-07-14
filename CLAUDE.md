@@ -12,7 +12,7 @@ Three independent apps in one repo:
 - `frontend/` — Vue 3 / Vite SOC-analyst UI (Naive UI, Pinia, Tailwind, pnpm)
 - `customer-portal/` — Vue 3 / Vite end-customer UI (port 3001 in dev, separate build)
 
-Plus `tools/remotion-*` (video generators) and `docs/` (mkdocs site, published by `docs-pages.yml`).
+Plus `tools/remotion-*` (video generators), `tools/ui-screenshots/`, and `docs/` (mkdocs site, published by `docs-pages.yml`).
 
 ## Common commands
 
@@ -69,7 +69,7 @@ Hooks: black (py3.11, **line-length 140** per `pyproject.toml`), isort (`force_s
 
 ### `backend/copilot.py` startup
 
-One FastAPI app mounts ~50 routers under `/api`. The `@app.on_event("startup")` hook runs in order:
+One FastAPI app mounts ~56 routers under `/api`. Startup runs inside an `@asynccontextmanager` `lifespan()` (registered via `FastAPI(..., lifespan=lifespan)`, not the deprecated `@app.on_event("startup")`), in this order:
 
 1. (PRODUCTION env only) `create_database_if_not_exists` + `create_copilot_user_if_not_exists` — bootstraps MySQL via root creds
 2. `apply_migrations()` — Alembic `upgrade head`
@@ -86,7 +86,7 @@ CORS is wide open (`allow_origins=["*"]`). Auth is per-route via `app.auth.utils
 Three sibling namespaces with distinct roles — pick the right one:
 
 - **`app/connectors/<tool>/`** — first-party deeply-integrated tools (Wazuh indexer/manager, Graylog, Velociraptor, Cortex, Grafana, InfluxDB, Shuffle, Sublime, Portainer, Talon, event_shipper). Credentials live in the `connectors` table. The Talon connector is special — see "AI analyst pipeline" below.
-- **`app/integrations/<tool>/`** — pluggable 3rd-party services (CrowdStrike, Carbon Black, Defender, Bitdefender, Mimecast, Huntress, Darktrace, Duo, Cato, Office 365, GitHub Audit, …) plus higher-level integration features (`alert_creation_settings`, `alert_escalation`, `copilot_action`, `copilot_mcp`, `copilot_searches`, `monitoring_alert`, `modules`). Auth keys are persisted per-customer (`integration_auth_keys`).
+- **`app/integrations/<tool>/`** — pluggable 3rd-party services (CrowdStrike, Carbon Black, Defender, Bitdefender, Mimecast, Huntress, Darktrace, Duo, Cato, Office 365, GitHub Audit, Nuclei, SAP SIEM, ScoutSuite, SOCFortress MDR, Microsoft Patch Tuesday, …) plus higher-level integration features (`alert_creation_settings`, `alert_escalation`, `copilot_action`, `copilot_mcp`, `copilot_searches`, `monitoring_alert`, `modules`). Auth keys are persisted per-customer (`integration_auth_keys`). Note: `app/integrations/ask_socfortress/` exists on disk but is fully disabled — its router import/include in `copilot.py` is commented out. Don't assume every dir under `integrations/` is live.
 - **`app/routers/<feature>.py`** — top-level FastAPI routers that compose connectors + integrations into product features. Every router must be imported and `include_router`-ed in `copilot.py`.
 
 ### Module layout: `routes / services / schema`
@@ -111,22 +111,22 @@ The "AI Analyst" feature is a *separate service*: [Talon](https://github.com/tay
 
 **Data flow** (both directions matter):
 
-1. **CoPilot → Talon (outbound)** — `app/connectors/talon/` is a normal CoPilot connector. The HTTP endpoint + API key live in the `connectors` table (`TALON_URL=http://127.1.1.1:3100`, `TALON_API_KEY` per `.env.example`). `app/connectors/talon/utils/universal.py` exposes async GET/POST helpers and an SSE streaming POST. Triggers: a real-time `POST /investigate` when an alert lands, an analyst-initiated `POST /message`, plus status/job lookups (`GET /status`, `GET /jobs/:alertId`).
+1. **CoPilot → Talon (outbound)** — `app/connectors/talon/` is a normal CoPilot connector. The HTTP endpoint + API key live in the `connectors` table (`TALON_URL=http://127.1.1.1:3100`, `TALON_API_KEY` per `.env.example`). `app/connectors/talon/utils/universal.py` exposes `async def` GET/POST helpers (though these wrap blocking `requests` calls internally — only the SSE POST is genuinely async I/O via `httpx`). Triggers: a real-time `POST /investigate` when an alert lands, an analyst-initiated `POST /message`, plus status/job lookups (`GET /status`, `GET /jobs/:alertId`).
 2. **Talon → CoPilot (inbound write-back)** — Talon's agent has *read-only* MySQL access; all writes go through CoPilot REST endpoints (mounted under `/api/ai_analyst`, lives in `app/ai_analyst/routes/`). These power the agent's MCP tools (`CreateAiAnalystJobTool`, `SubmitAiAnalystReportTool`, `SubmitAiAnalystIocsTool`, `ListAiAnalystJobsByAlertTool`, …) defined in the `copilot-mcp-server` repo.
 3. **Scheduled fallback** — every 15 min Talon queries `incident_management_alert` JOIN `incident_management_asset` LEFT JOIN `ai_analyst_job` for OPEN alerts with no job row, and runs the same investigation workflow as the real-time path.
 
 **Persisted state on the CoPilot side** lives in `app/db/universal_models.py` as the `AiAnalyst*` block — `ai_analyst_job → ai_analyst_report → ai_analyst_ioc`, plus the human-feedback tables `ai_analyst_review`, `ai_analyst_ioc_review`, and `ai_analyst_palace_lesson`. The palace-lesson table is a queue: a CoPilot async drainer POSTs queued lessons to NanoClaw's `POST /palace/lesson` (which wraps a MemPalace MCP write), then flips the row from `pending` → `ingested` and stores the returned `drawer_id` for later expiry. CoPilot never speaks to MemPalace directly — every palace interaction is proxied via NanoClaw HTTP. See "Database structure" below for the table-level shape.
 
-**Per-customer auto-trigger** is gated by `incident_management_ai_analyst_trigger_enabled` (one row per customer; default off). Don't fire investigations for a customer whose row is missing or `enabled=false`.
+**Per-customer auto-trigger** is gated by `incident_management_ai_analyst_trigger_enabled` (one row per customer; `enabled` **defaults to `True`** on the model). Don't fire investigations for a customer whose row is missing or `enabled=false` — but note new rows are opted in by default, not out.
 
 ### Database structure
 
-MySQL is the primary store via async SQLAlchemy/SQLModel (`app/db/db_session.py`); SQLite fallback in `backend/settings.py`. MinIO handles object storage (`app/data_store/`). Roughly **80 SQLModel tables** spread across the codebase — the map below is the orientation aid.
+MySQL is the primary store via async SQLAlchemy/SQLModel (`app/db/db_session.py`); SQLite fallback in `backend/settings.py`. MinIO handles object storage (`app/data_store/`). Roughly **100 SQLModel tables** spread across the codebase — the map below is the orientation aid.
 
-**Tenancy keystone — `customers.customer_code`.** A `varchar(50)` PK on the `customers` table that is the universal tenant key. Every per-tenant feature carries it. Two enforcement levels exist in the wild and you must read carefully which one a model uses:
+**Tenancy keystone — `customers.customer_code`.** The universal tenant key that every per-tenant feature carries. **It is not the table's PK** — `customers.id` (autoincrement int) is — `customer_code` is a plain indexed, non-unique `varchar(50)` column. Two enforcement levels exist in the wild and you must read carefully which one a model uses:
 
-- **Hard FK** (`foreign_key="customers.customer_code"`) — agents, agent_vulnerabilities, vulnerability_reports, sca_reports, event_sources, enabled_dashboards, AI analyst tables, customer_notification_route, customer_shuffle_integration, github_audit_config, github_audit_report, customers_meta. Deletes/renames cascade where set up.
-- **String only, no FK** — `incident_management_alert.customer_code`, `incident_management_asset.customer_code`, `incident_management_case.customer_code`, `monitoring_alerts.customer_code`, `customer_integrations.customer_code`, `customer_network_connectors.customer_code`, `custom_alert_creation_settings.customer_code`. The ingest pipeline can land alerts for codes that don't exist yet — orphaned rows are tolerated by design. Don't add a new join expecting referential integrity.
+- **Hard FK** (`foreign_key="customers.customer_code"`) — agents, agent_vulnerabilities, vulnerability_reports, sca_reports, event_sources, enabled_dashboards, AI analyst tables, customer_notification_route, customer_shuffle_integration, customers_meta. Deletes/renames cascade where set up.
+- **String only, no FK** — `incident_management_alert.customer_code`, `incident_management_asset.customer_code`, `incident_management_case.customer_code`, `monitoring_alerts.customer_code`, `customer_integrations.customer_code`, `customer_network_connectors.customer_code`, `custom_alert_creation_settings.customer_code`, `github_audit_config.customer_code`, `github_audit_report.customer_code`. The ingest pipeline can land alerts for codes that don't exist yet — orphaned rows are tolerated by design. Don't add a new join expecting referential integrity.
 
 **Permissions / RBAC** (`app/auth/models/`):
 
@@ -182,7 +182,7 @@ Consequence: refreshing CoPilot Searches refreshes the Stories surface; Wazuh ru
 
 **Surfaces (browse modes):**
 
-- **CoPilot Searches tab** (URL token still `?tab=stories` for back-compat) — CoPilot Searches rules grouped by `analytic_story` tag. Click a row → story detail page (description, member detections table, deduplicated data sources / references). The story detail is its own URL state (`?story=Foo`), not a tab.
+- **CoPilot Searches tab** — CoPilot Searches rules grouped by `analytic_story` tag. Click a row → story detail (description, member detections table, deduplicated data sources / references), rendered as a modal (`StoriesIndex.vue`'s `selectedStoryName` ref) — not URL/query-synced.
 - **Wazuh Rules tab** — flat searchable grid over the entire Wazuh ruleset (~3–5k rows). Columns: ID · Level · Description · Groups · MITRE · File · Hits 30d (with 7d sub-count) when firing stats available. Quick-filter chips **All / Top noisy (50) / Dead (level ≥7, 0 hits 30d)** for tuning workflows. Customer-scope dropdown to slice firing stats by `agent_labels_customer` (or `agent.labels.customer` — both shapes tried). Row click → modal with full meta + reconstructed `<rule>` XML + "Last fired" relative timestamp.
 - **Coverage Gaps tab** — MITRE techniques no rule in either corpus addresses. Sub-techniques collapsed into parents (a hit on T1059.001 counts as coverage for T1059) — listing every sub-technique would flood the gap report.
 - **Compliance tab** — Wazuh rules grouped by control IDs for a selected compliance framework (PCI DSS / HIPAA / NIST 800-53 / GDPR / TSC / GPG13). Each row shows rule count + total firing hits per control. Frameworks are statically declared in `services/detection_catalog.py:COMPLIANCE_FRAMEWORKS` — adding a new one is one row in that dict + the field already being on the cached Wazuh rules.
@@ -204,19 +204,21 @@ Consequence: refreshing CoPilot Searches refreshes the Stories surface; Wazuh ru
   - `GET /catalog/compliance/frameworks` (static, before wildcard) + `GET /catalog/compliance/{framework}` (framework key from `COMPLIANCE_FRAMEWORKS` dict; 400 on unknown)
   - `POST /catalog/wazuh-rules/test` — logtest
 - Frontend view: `src/views/DetectionCatalog.vue` (thin wrapper) → `src/components/detectionCatalog/` directory:
-  - `DetectionCatalogShell.vue` — header strip + tab switcher (URL-synced via `?tab=stories|wazuh|gaps`)
-  - `StoriesIndex.vue` + `StoryDetail.vue` — the original Stories surface
+  - `DetectionCatalogShell.vue` — header strip + plain `<n-tabs>` switcher (four tabs: stories/wazuh/gaps/compliance; **no URL/query-param sync** — switching tabs does not touch the route)
+  - `DetectionCatalogStats.vue` — header strip stat tiles
+  - `StoriesIndex.vue` + `StoryDetail.vue` — the original Stories surface (story detail is a modal driven by a local ref, not a route)
   - `WazuhRulesIndex.vue` — Wazuh tab grid + quick-filter chips + customer-scope dropdown, mounts `WazuhLogTest.vue` above the table
   - `WazuhRuleDetail.vue` — Wazuh rule detail modal contents (incl. Last fired relative-time badge)
   - `WazuhLogTest.vue` — collapsible logtest panel, persists last 5 tests to localStorage
   - `CoverageGapsIndex.vue` — Coverage Gaps tab
   - `ComplianceIndex.vue` — Compliance tab (framework selector + grouped table + drill-down modal)
-- Frontend supporting files: `src/types/detectionCatalog.d.ts`, `src/api/endpoints/detectionCatalog.ts`
-- Three authorized cross-cutting edits and only these three: nav entry in `app-layouts/common/Navbar/items.tsx`, route in `router/index.ts`, barrel registration in `api/index.ts`. Nothing else outside the catalog namespace should change for this feature.
+  - `ComplianceDetail.vue` — Compliance drill-down modal contents
+- Frontend supporting files: `src/types/detection-catalog.ts`, `src/api/endpoints/detection-catalog.ts`
+- Three authorized cross-cutting edits and only these three: nav entry in `app-layouts/common/Navbar/items.tsx`, route in `router/routes/analyst.ts`, barrel registration in `api/index.ts`. Nothing else outside the catalog namespace should change for this feature.
 
 ### Frontend essentials
 
-- `src/api/httpClient.ts` (axios) and `src/api/sseClient.ts` (`@microsoft/fetch-event-source`) — backend traffic. Wrappers in `src/api/endpoints/`.
+- `src/api/http-client.ts` (axios) and `src/api/sse-client.ts` (`@microsoft/fetch-event-source`) — backend traffic. Wrappers in `src/api/endpoints/`.
 - `src/stores/` — Pinia with `pinia-plugin-persistedstate`, encrypted via `secure-ls`.
 - Tailwind v4 + Naive UI; design tokens flow from `figma-tokens.json` via `pnpm design-tokens`.
 - `@shuffleio/shuffle-mcps` is embedded as a frontend dependency for per-org Shuffle app management.
@@ -225,7 +227,7 @@ The `customer-portal/` mirrors this structure but is a leaner standalone app, se
 
 ### CI (`.github/workflows/`)
 
-- `docker.yml` — multi-arch builds → `ghcr.io/socfortress/copilot-{backend,frontend,customer-portal,mcp,nuclei-module,minio}`
+- `docker.yml` — single-arch builds (no `platforms:` key) for `ghcr.io/socfortress/copilot-{backend,frontend,customer-portal}` only. `docker-compose.yml` also references `copilot-{mcp,nuclei-module,minio}` images, but this repo's CI does not build them — they come from elsewhere.
 - `pre-commit.yml` — runs the hooks above on PRs
 - `docs-pages.yml` — mkdocs → GitHub Pages from `docs/` (`mkdocs.yml`)
 
@@ -239,7 +241,7 @@ The `customer-portal/` mirrors this structure but is a leaner standalone app, se
 - **`.env` is shared across compose services.** Backend and `copilot-mcp` both read it; many MCP vars fall back to `WAZUH_*` defaults — renaming without fixing fallbacks breaks MCP wiring.
 - **Black line length is 140**, not 88. **isort `force_single_line = true`** — combined imports get split.
 - **Pydantic 2 strictness regressions are still surfacing across the codebase.** The repo migrated from v1 to v2; v1 was lenient where v2 errors. Three patterns to watch for:
-  - **Leading-underscore field annotations get silently dropped as `PrivateAttr`.** A field like `_source: GenericSourceModel` parses as nothing — Pydantic 2 never populates it. Use `source: GenericSourceModel = Field(alias="_source")` plus `model_config = ConfigDict(populate_by_name=True)`. We've hit this on `_source` (`GenericAlertModel`) and `_client_config` (Velociraptor `Organization`).
+  - **Leading-underscore field annotations get silently dropped as `PrivateAttr`.** A field like `_source: GenericSourceModel` parses as nothing — Pydantic 2 never populates it. Fix by aliasing: `source: GenericSourceModel = Field(alias="_source")` plus `model_config = ConfigDict(populate_by_name=True)` (the `GenericAlertModel` fix). Where the field isn't actually needed, the alternative is to omit it from the schema entirely and rely on `extra="allow"`/`extra="ignore"` — that's what Velociraptor's `Organization` model does with `_client_config`, so don't assume every occurrence of this bug was fixed the same way.
   - **Pydantic schemas fed SQLAlchemy/SQLModel rows need `model_config = ConfigDict(from_attributes=True)`** (the rename of v1's `orm_mode`). Symptom is a 400/500 with `Input should be a valid dictionary or instance of <ClassName>` even though the input *is* an instance — Pydantic 2 enforces exact class match, and ORM-row → Pydantic-schema extraction requires this config explicitly. Audit signal: any Pydantic class that shares a name with a `SQLModel(table=True)` is suspicious. Whole chains of nested response models (`CustomerIntegrations` → `IntegrationSubscription` → `IntegrationService` → `IntegrationAuthKeys`) need it on every level when joinedload feeds them.
   - **v2 stops coercing `bool→str`, `int→str`, etc.** A schema typed `success: str` whose callers all pass `success=True` worked in v1 (silently coerced to `"True"`); v2 errors with `Input should be a valid string [type=string_type, input_value=True, input_type=bool]`. Fix the schema's type to match what callers actually pass, not the other way around.
 - **`regex=` → `pattern=` is FastAPI-only.** FastAPI 0.116 deprecated `regex=` on `Query/Path/Header/Body` in favor of `pattern=`. **`sqlmodel.Field` still uses `regex=` and rejects `pattern=`** — blindly running a global rename will crashloop the backend at import time with `TypeError: Field() got an unexpected keyword argument 'pattern'`. Pydantic v2 native `Field` uses `pattern=`. Three different surfaces, three different rules; check the import before renaming.
@@ -247,8 +249,7 @@ The `customer-portal/` mirrors this structure but is a leaner standalone app, se
 - **`elasticsearch7.exceptions.RequestError` message lives on `.info`, not `str(err)`.** `str(err)` returns only the error code (`search_phase_execution_exception`); the human-readable cause is on `err.info`. `_is_text_field_agg_error` in `app/siem/services/dashboards.py` is the canonical example — match against `err.error` for the type and `str(err.info)` for the message.
 - **FastAPI route ordering inside a single router: static paths must come before wildcards.** A `@router.get("/{id}")` declared above `@router.get("/library")` will swallow `/library` and try to parse `"library"` as the `id` param, returning a 422 with `Input is not a valid integer`. We've hit this on both the Case Templates Library (`/library` vs `/{template_id}`) and the Detection Catalog (`/catalog/stats`, `/catalog/stories` vs `/catalog/stories/{story_name:path}`). When appending new routes to an existing router, scan for wildcard routes already declared and insert above them.
 - **Vue JSX (`<script setup lang="tsx">`) does not use the `:` v-bind prefix.** Inside a `.vue` `<template>` you write `<NTag :bordered="false">`; inside a JSX `render: row => (...)` you write `<NTag bordered={false}>`. Mixing them up — easy when copying from one to the other — produces a Vite parser error (`Unexpected token`). The catalog's `StoriesIndex.vue` / `StoryDetail.vue` are pure-JSX render columns; the surrounding `<template>` is Vue syntax. Don't conflate.
-- **SPA sub-views driven by URL query params: `push` to open, `replace` to close.** When a parent component swaps between an index view and a detail view based on a query param (`?story=Foo`), entering the detail must use `router.push` so the browser-back button lands on the index, not on whatever was open before this page. Exiting via an in-app button should use `router.replace` to avoid piling up duplicate index entries in history. Detection Catalog's `DetectionCatalogShell.vue` `openStory` / `closeStory` is the canonical pair — getting this wrong is invisible until a user complains that browser-back skips the index entirely.
-- **Iconify icon collections loaded in the frontend: `carbon:`, `mdi:`, `logos:`.** `simple-icons:` and other unbundled sets render as an empty box with no console error. If you reach for `simple-icons:wazuh` or similar, either switch to a loaded set or fall back to a plain text label.
+- **Icons load dynamically via `@iconify/vue`'s `loadIcon()`** (no offline bundle/allowlist found in the frontend build) — `carbon:`, `mdi:`, `logos:` are confirmed working in this codebase. If an icon (e.g. `simple-icons:wazuh`) renders as an empty box with no console error, check network access to Iconify's API before assuming the collection is unsupported; fall back to a plain text label if it's genuinely unreachable.
 - **`app/connectors/wazuh_manager/utils/universal.py:send_put_request` form-encodes dicts even with `Content-Type: application/json`.** The helper sets the JSON content-type header but then calls `requests.put(data=<dict>)`, which `requests` URL-form-encodes (`key=value&key=value`). Wazuh sees the JSON header but a form-encoded body, tries to parse it as JSON, and 400s with `Expecting value: line 1 column 1 (char 0)`. **Fix at the call site by pre-serializing**: `send_put_request(endpoint="/logtest", data=json.dumps(payload))` — `requests` sends string bodies as-is, no encoding. The wazuh-manager `logtest.py` connector has the canonical example. Don't try to "fix" it by passing a dict and assuming JSON encoding; the helper is used by the rule-file-upload flow which expects raw bytes/XML, and changing it globally would break that path. (Cleaner long-term fix would be a `json_data=True` flag on the helper, but it touches every Wazuh integration that PUTs.)
 - **Cross-branch local-DB alembic divergence is invisible until startup.** If you run a migration from a feature branch against your local DB and then switch to a different branch that lacks the migration file, `apply_migrations()` at startup crashes with `Can't locate revision identified by <hash>` — the DB's `alembic_version` table records the missing revision, alembic has no file to walk. **Safe recovery**: `git checkout <other-branch-commit> -- backend/alembic/versions/<missing-revision>_*.py` (plus any predecessors in the chain). That brings the migration *file* into the working tree without changing the DB — the schema the file describes is already applied, alembic just needs the file to recognize the state. Don't `UPDATE alembic_version` manually unless you're prepared to fight it later; don't `alembic downgrade` unless you genuinely want to drop the columns.
 - **Don't assume Wazuh alerts live only in `wazuh-alerts-*`.** Real SOCFortress deployments spread alerts across vendor- and customer-prefixed indices: `office365-<customer_code>`, `crowdstrike-<customer_code>`, `carbonblack-<customer_code>`, `huntress_<customer_code>`, ad-hoc `newest-*` test indices, and so on — easily 1500+ on lab clusters. A query targeting only `wazuh-alerts-*` will miss the bulk of real traffic. Equally, `wazuh-*` is *too broad* and includes Wazuh's own internal indices (`wazuh-monitoring-*`, `wazuh-statistics-*`, `wazuh-states-*`, `wazuh-vulnerabilities-*`) — those carry `rule.id` for system/control events with Wazuh's parent-template rule IDs (2 = firewall template, 3 = ids template, 4 = web-log template) that never fire on real analyst alerts but produce massive fake hit counts. **Use ES's native wildcard+exclusion pattern**, not client-side index enumeration: `*,-.*,-_*,-wazuh-monitoring-*,-wazuh-statistics-*,-wazuh-states-*,-wazuh-vulnerabilities-*,-security-auditlog-*` passes as one short string and ES resolves it server-side. `wazuh_firing_stats_cache.py:ALERT_INDEX_PATTERN` is the canonical implementation. Integer coercion on the bucket keys naturally drops vendor-native rule IDs that aren't Wazuh-compatible, so over-including is safe.
